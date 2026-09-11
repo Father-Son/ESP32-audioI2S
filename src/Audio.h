@@ -537,6 +537,10 @@ class Audio {
     NetworkClient       client;
     NetworkClientSecure clientsecure;
     NetworkClient*      m_client = nullptr;
+    NetworkClient       client_manifest;
+    NetworkClientSecure clientsecure_manifest;
+    NetworkClient*      m_client_manifest = nullptr;
+    ps_ptr<char>        m_lastManifestHost;
 
     SemaphoreHandle_t mutex_audioTask;
     SemaphoreHandle_t mutex_audioTaskIsDecoding;

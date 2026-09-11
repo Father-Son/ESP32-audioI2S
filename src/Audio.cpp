@@ -722,6 +722,7 @@ Audio::Audio(uint8_t i2sPort) {
     mutex_audioTask = xSemaphoreCreateMutex();
     mutex_audioTaskIsDecoding = xSemaphoreCreateMutex();
     clientsecure.setInsecure();
+    clientsecure_manifest.setInsecure();
     m_i2s_items.i2s_num = i2sPort; // i2s port number
 
     i2s_event_callbacks_t cbs = {};
@@ -824,6 +825,10 @@ void Audio::setDefaults() {
     client.stop();
     clientsecure.stop();
     m_client = static_cast<NetworkClient*>(&client); /* default to *something* so that no NULL deref can happen */
+    m_client_manifest = static_cast<NetworkClient*>(&client_manifest);
+    m_lastManifestHost.reset();
+    client_manifest.stop();
+    clientsecure_manifest.stop();
 
     m_f_timeout = false;
     m_f_chunked = false; // Assume not chunked
@@ -1223,8 +1228,11 @@ bool Audio::httpPrint(const char* host) {
     if (query_string.strlen()) extension.appendf("?{}", query_string);
     path = urlencode(extension.get(), true);
 
-    if (!m_currentHost.valid()) m_currentHost.assign("");
-    auto dismantledLastHost = dismantle_host(m_currentHost.get());
+    bool isManifestRequest = (m_dataMode == AUDIO_PLAYLISTINIT || m_dataMode == AUDIO_PLAYLISTDATA || extension.contains(".m3u8"));
+    NetworkClient*& activeClient = isManifestRequest ? m_client_manifest : m_client;
+    ps_ptr<char>& activeLastHost = isManifestRequest ? m_lastManifestHost : m_currentHost;
+    if (!activeLastHost.valid()) activeLastHost.assign("");
+    auto dismantledLastHost = dismantle_host(activeLastHost.get());
     cur_hwoe = dismantledLastHost.hwoe;
 
     bool f_equal = true;
@@ -1233,9 +1241,13 @@ bool Audio::httpPrint(const char* host) {
     } else {
         f_equal = false;
     }
+    if (m_playlistFormat != FORMAT_M3U8 && (m_dataMode == AUDIO_PLAYLISTINIT || m_dataMode == AUDIO_PLAYLISTDATA)) {
+        if (activeClient && activeClient->connected()) activeClient->stop();
+        f_equal = false;
+    }
     // Classic playlist entries often leave a stale keep-alive socket; force a fresh connection for the resolved stream URL.
     if (m_playlistFormat != FORMAT_M3U8 && (m_dataMode == AUDIO_PLAYLISTINIT || m_dataMode == AUDIO_PLAYLISTDATA)) {
-        if (m_client && m_client->connected()) m_client->stop();
+        if (activeClient && activeClient->connected()) activeClient->stop();
         f_equal = false;
     }
 
@@ -1255,26 +1267,27 @@ bool Audio::httpPrint(const char* host) {
 
     info(*this, evt_info, "next URL: \"{}\"", c_host.get());
 
-    if (f_equal == false) {
-        if (m_client->connected()) m_client->stop();
+    if (f_equal == false && activeClient) {
+        if (activeClient->connected()) activeClient->stop();
     }
-    if (!m_client->connected()) {
+    if (activeClient == nullptr || !activeClient->connected()) {
         if (m_f_ssl) {
-            m_client = static_cast<NetworkClientSecure*>(&clientsecure);
-            if (m_f_ssl && port == 80) port = 443;
+            activeClient = isManifestRequest ? static_cast<NetworkClientSecure*>(&clientsecure_manifest) : static_cast<NetworkClientSecure*>(&clientsecure);
+            if (port == 80) port = 443;
         } else {
-            m_client = static_cast<NetworkClient*>(&client);
+            activeClient = isManifestRequest ? static_cast<NetworkClient*>(&client_manifest) : static_cast<NetworkClient*>(&client);
         }
         if (f_equal) info(*this, evt_info, "The host has disconnected, reconnecting");
 
-        if (!m_client->connect(hwoe.get(), port)) {
+        if (!activeClient->connect(hwoe.get(), port)) {
             AUDIO_LOG_ERROR("connection lost {}", c_host.c_get());
             stopSong();
             return false;
         }
     }
-    m_currentHost = c_host;
-    m_client->print(rqh.get());
+    activeLastHost = c_host;
+    if (!isManifestRequest) { m_currentHost = c_host; }
+    activeClient->print(rqh.get());
 
     if (extension.ends_with_icase(".mp3"))
         m_expectedCodec = CODEC_MP3;
@@ -4012,6 +4025,9 @@ void Audio::loop() {
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 bool Audio::readPlayListData() {
 
+    NetworkClient* backupClient = m_client;
+    if (m_playlistFormat == FORMAT_M3U8) { m_client = m_client_manifest; }
+
     int32_t      chunkLen = 0;
     uint16_t     readedBytes = 0;
     uint16_t     count = 0;
@@ -4152,12 +4168,14 @@ bool Audio::readPlayListData() {
     } // outer while
 
     m_dataMode = AUDIO_PLAYLISTDATA;
+    m_client = backupClient;
     return true;
 
 exit:
     m_playlistContent.clear();
     m_playlistContent.shrink_to_fit();
     getChunkSize(0, true);
+    m_client = backupClient;
     return false;
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————-
